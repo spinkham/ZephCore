@@ -97,7 +97,16 @@ bool ZephyrDataStore::mount()
 		return false;
 	}
 
-	/* Check if external QSPI was automounted */
+	/* Check if external QSPI was automounted. Only probe /ext when a board
+	 * actually declares the qspi_lfs fstab node (via qspi-ext.dtsi) — on
+	 * boards with no QSPI flash (e.g. XIAO MG24 / carrier-v3), /ext is never
+	 * registered with Zephyr's fs subsystem at all, so fs_statvfs() on it
+	 * would log a raw, scary-looking "fs: mount point not found!!" from
+	 * subsys/fs/fs.c on every single boot — cosmetic (identity/prefs live on
+	 * /lfs, checked above, and are unaffected), but easily mistaken for a
+	 * real persistence failure. Same compile-time guard formatFileSystem()
+	 * already uses below. */
+#if DT_NODE_EXISTS(DT_NODELABEL(qspi_lfs))
 	if (is_mounted(extMountPoint())) {
 		ext_lfs_mounted = true;
 		LOG_INF("External QSPI LittleFS at %s (automounted, 100 blobs)", extMountPoint());
@@ -105,6 +114,10 @@ bool ZephyrDataStore::mount()
 		ext_lfs_mounted = false;
 		LOG_INF("External QSPI NOT mounted at %s - using internal only (20 blobs)", extMountPoint());
 	}
+#else
+	ext_lfs_mounted = false;
+	LOG_INF("No QSPI ext flash on this board - using internal only (20 blobs)");
+#endif
 
 	return true;
 }
