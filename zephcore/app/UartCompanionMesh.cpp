@@ -21,6 +21,55 @@ UartCompanionMesh::UartCompanionMesh(mesh::Radio &radio, mesh::MillisecondClock 
 	initNodePrefs(&prefs);
 	memset(_ack_table, 0, sizeof(_ack_table));
 	_ack_next_overwrite = 0;
+	memset(_drone_base_pubkey, 0, sizeof(_drone_base_pubkey));
+	_drone_base_pubkey_set = false;
+}
+
+void UartCompanionMesh::setDroneBaseContact(const uint8_t pubkey[PUB_KEY_SIZE])
+{
+	memcpy(_drone_base_pubkey, pubkey, PUB_KEY_SIZE);
+	_drone_base_pubkey_set = true;
+}
+
+bool UartCompanionMesh::sendDetectionToBase(const char *text)
+{
+	if (!_drone_base_pubkey_set) {
+		LOG_WRN("sendDetectionToBase: drone-base contact not configured");
+		return false;
+	}
+
+	ContactInfo *contact = lookupContactByPubKey(_drone_base_pubkey, PUB_KEY_SIZE);
+	if (!contact) {
+		LOG_WRN("sendDetectionToBase: drone-base contact not found");
+		return false;
+	}
+
+	uint32_t expected_ack = 0, est_timeout = 0;
+	uint32_t now = getRTCClock()->getCurrentTimeUnique();
+	int result = sendMessage(*contact, now, /*attempt*/ 1, text, expected_ack, est_timeout);
+	if (result == MSG_SEND_FAILED) {
+		LOG_WRN("sendDetectionToBase: sendMessage failed for '%s'", contact->name);
+		return false;
+	}
+
+	if (expected_ack) {
+		/* Resolve the contact's slot index the same way CompanionMesh's
+		 * CMD_SEND_TXT_MSG handler does, since sendMessage() only hands back
+		 * the ContactInfo, not its index. */
+		int idx = -1;
+		ContactInfo ci;
+		for (int k = 0; k < getNumContacts(); k++) {
+			if (getContactByIdx(k, ci) && ci.id.matches(contact->id)) {
+				idx = k;
+				break;
+			}
+		}
+		addPendingAck(expected_ack, idx);
+	}
+
+	LOG_INF("sendDetectionToBase: sent to '%s' result=%d expected_ack=0x%08x est_timeout=%u",
+		contact->name, result, expected_ack, est_timeout);
+	return true;
 }
 
 void UartCompanionMesh::addPendingAck(uint32_t expected, int contact_idx)

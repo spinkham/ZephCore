@@ -41,16 +41,24 @@ public:
 	 * drone-base auto-adds this node as a contact via onAdvertRecv. */
 	bool sendSelfAdvert(bool flood) override;
 
-	/* TODO (Phase 2): parse a C5 detection frame (CMD_RID_DETECTION /
-	 * CMD_RID_FORMATTED_MSG — see lib/meshcore_shared and the UART protocol
-	 * used by nodes/remote_meshcore_node) received over the C5 UART, build
-	 * the Identity/Telemetry TXT_MSG text, and send it via
-	 * BaseChatMesh::sendMessage(drone_base_contact, ...), tracking the
-	 * expected ACK with addPendingAck(). Left unimplemented for this
-	 * build-and-boot skeleton — see main_uart_companion.cpp's
-	 * process_c5_uart() for the current byte-drain stub.
+	/* Record the pinned drone-base contact's pubkey so sendDetectionToBase()
+	 * can find it via lookupContactByPubKey(). Call once after addContact()
+	 * has added the drone-base contact — see main_uart_companion.cpp's
+	 * add_drone_base_contact(). */
+	void setDroneBaseContact(const uint8_t pubkey[PUB_KEY_SIZE]);
+
+	/* Increment 2: send a pre-formatted 'I'/'T' MeshCore TXT_MSG (already
+	 * decoded from a CMD_RID_FORMATTED_MSG C5 frame — see
+	 * main_uart_companion.cpp's process_c5_uart()/c5_frame_dispatch()) to the
+	 * pinned drone-base contact via BaseChatMesh::sendMessage(), tracking the
+	 * expected ACK with addPendingAck() so a later increment can match it in
+	 * processAck(). No retry here — a single send + recorded expected-ack is
+	 * the whole job of this increment. Returns false (LOG_WRN'd) if the
+	 * drone-base contact isn't registered yet or sendMessage() reports
+	 * MSG_SEND_FAILED; true means the packet was handed to the dispatcher
+	 * (flood or direct), not that delivery was confirmed.
 	 */
-	// void sendDetectionToBase(const ContactInfo &drone_base, const char *text);
+	bool sendDetectionToBase(const char *text);
 
 	/* Pending-ACK tracking (model: CompanionMesh::addPendingAck/
 	 * findAndRemoveAck). contact_idx is whatever sendMessage's caller wants
@@ -86,4 +94,7 @@ private:
 	};
 	AckEntry _ack_table[UART_COMPANION_ACK_TABLE_SIZE];
 	int _ack_next_overwrite;
+
+	uint8_t _drone_base_pubkey[PUB_KEY_SIZE];
+	bool _drone_base_pubkey_set;
 };

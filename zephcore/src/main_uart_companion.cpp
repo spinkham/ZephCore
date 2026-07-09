@@ -10,8 +10,12 @@
  * the C5 detection-frame link (`zephcore,c5-uart` chosen node — see the
  * paired boards/common/uart_companion.overlay).
  *
- * SCOPE: this file builds and boots. The C5 frame parse/send path is
- * stubbed — see process_c5_uart() below.
+ * SCOPE (increment 2 of 4): the C5 frame parser and CMD_RID_FORMATTED_MSG ->
+ * BaseChatMesh::sendMessage() path are implemented — see process_c5_uart()
+ * and c5_frame_dispatch() below, and UartCompanionMesh::sendDetectionToBase().
+ * CMD_RID_DETECTION (raw ODID) handling and ACK-driven retry are later
+ * increments (dispatch logs and drops CMD_RID_DETECTION for now; a single
+ * send + recorded expected-ack is as far as this increment goes).
  */
 
 #include <stdio.h>
@@ -69,6 +73,7 @@ extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
 
 /* Radio + mesh includes (shared header selects LR1110 or SX126x) */
 #include <mesh/RadioIncludes.h>
+#include <mesh/Utils.h>  /* mesh::Utils::fromHex — used by the ridframe bench CLI hook */
 
 /* LED configuration */
 #if DT_NODE_HAS_PROP(DT_ALIAS(led0), gpios)
@@ -240,28 +245,161 @@ static void c5_uart_isr(const struct device *dev, void *user_data)
 	}
 }
 
-/* Drain bytes from the C5 scanner UART and log them.
+/* ========================================================================
+ * C5 UART wire protocol — mirrors the top-level repo's
+ * lib/meshcore_shared/src/meshcore_shared.h (MESHCORE_FRAME_IN,
+ * CMD_RID_DETECTION, CMD_RID_FORMATTED_MSG, RID_FORMATTED_MSG_MAX_TEXT) and
+ * lib/meshcore_shared/src/rid_uart_protocol.h. Those headers live in the
+ * Arduino/PlatformIO build tree (HardwareSerial etc.) and aren't shared with
+ * this Zephyr build, so the constants and framing state machine are
+ * hand-ported here — keep in sync if the wire format ever changes. Direct
+ * template: nodes/nrf52_meshcore_node/src/c5_uart_rx.cpp.
  *
- * TODO (Phase 2): parse CMD_RID_DETECTION / CMD_RID_FORMATTED_MSG frames
- * (see lib/meshcore_shared and the UART protocol used by
- * nodes/remote_meshcore_node) out of this byte stream, build the
- * Identity/Telemetry TXT_MSG text, and call
- * uart_companion_mesh_ptr->sendMessage(drone_base_contact, ...) — see the
- * TODO on UartCompanionMesh::sendDetectionToBase() in UartCompanionMesh.h.
- * For now this just proves the UART link is alive end to end (bench-day:
- * confirm bytes typed at the C5 side show up in this log). */
+ * Wire layout: <marker><len_lo><len_hi><cmd><payload>
+ *   marker  = 0x3C (MESHCORE_FRAME_IN, repurposed as the C5->carrier
+ *             inter-chip direction marker — see the naming caveat in
+ *             rid_uart_protocol.cpp)
+ *   len     = uint16_t LE, counts the cmd byte + payload bytes (NOT the
+ *             marker/len bytes themselves)
+ *   cmd     = CMD_RID_DETECTION (0x70) or CMD_RID_FORMATTED_MSG (0x71)
+ *   payload = cmd-specific; CMD_RID_FORMATTED_MSG's payload is the raw
+ *             'I'/'T' TXT_MSG text, no NUL terminator on the wire
+ * No CRC, no closing/trailer marker — c5_uart_rx.cpp resyncs by returning to
+ * IDLE once `len` payload bytes are collected and waiting for the next 0x3C;
+ * this parser mirrors that exactly.
+ * ======================================================================== */
+#define C5_UART_FRAME_MARKER          0x3C
+#define C5_CMD_RID_DETECTION          0x70
+#define C5_CMD_RID_FORMATTED_MSG      0x71
+#define C5_RID_FORMATTED_MSG_MAX_TEXT 151
+
+enum class C5FrameState : uint8_t {
+	IDLE,
+	GOT_START,
+	GOT_LEN_LO,
+	IN_PAYLOAD,
+};
+
+static C5FrameState c5_frame_state = C5FrameState::IDLE;
+static uint16_t c5_frame_len = 0;
+static uint16_t c5_frame_pos = 0;
+/* Sized for the largest known opcode payload (CMD_RID_FORMATTED_MSG: cmd
+ * byte + up to C5_RID_FORMATTED_MSG_MAX_TEXT text bytes), plus slack —
+ * mirrors c5_uart_rx.cpp's s_buf sizing rationale. */
+static uint8_t c5_frame_buf[C5_RID_FORMATTED_MSG_MAX_TEXT + 16];
+
+/* Dispatch one complete frame. cmd/payload point into c5_frame_buf. */
+static void c5_frame_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
+{
+	switch (cmd) {
+	case C5_CMD_RID_FORMATTED_MSG: {
+		uint16_t text_len = len;
+		if (text_len > C5_RID_FORMATTED_MSG_MAX_TEXT) {
+			text_len = C5_RID_FORMATTED_MSG_MAX_TEXT;
+		}
+		char text[C5_RID_FORMATTED_MSG_MAX_TEXT + 1];
+		memcpy(text, payload, text_len);
+		text[text_len] = '\0';
+
+		LOG_INF("C5 frame: FORMATTED_MSG len=%d -> send", (int)text_len);
+#ifdef ZEPHCORE_LORA
+		if (uart_companion_mesh_ptr) {
+			uart_companion_mesh_ptr->sendDetectionToBase(text);
+		}
+#endif
+		break;
+	}
+	case C5_CMD_RID_DETECTION:
+		/* Raw ODID relay path — later increment. Drop for now. */
+		LOG_INF("C5 frame: RID_DETECTION (raw path TODO)");
+		break;
+	default:
+		LOG_WRN("C5 frame: unknown cmd=0x%02x len=%u, dropped", cmd, (unsigned)len);
+		break;
+	}
+}
+
+/* Single incremental parser step. This is the ONE entry point that both real
+ * C5 UART bytes (process_c5_uart(), below) and the `ridframe` bench-test CLI
+ * command (c5_ridframe_cli_cmd(), further down) feed through, so the CLI
+ * hook exercises the exact same state machine rather than a parallel
+ * test-only shortcut. State persists across calls so frames split across
+ * UART RX chunks parse correctly. */
+static void c5_frame_feed_byte(uint8_t b)
+{
+	switch (c5_frame_state) {
+	case C5FrameState::IDLE:
+		if (b == C5_UART_FRAME_MARKER) {
+			c5_frame_state = C5FrameState::GOT_START;
+		}
+		break;
+	case C5FrameState::GOT_START:
+		c5_frame_len = b;
+		c5_frame_state = C5FrameState::GOT_LEN_LO;
+		break;
+	case C5FrameState::GOT_LEN_LO:
+		c5_frame_len |= ((uint16_t)b) << 8;
+		if (c5_frame_len == 0 || c5_frame_len > sizeof(c5_frame_buf)) {
+			LOG_WRN("C5 frame: bad length=%u, resync", (unsigned)c5_frame_len);
+			c5_frame_state = C5FrameState::IDLE;
+			break;
+		}
+		c5_frame_pos = 0;
+		c5_frame_state = C5FrameState::IN_PAYLOAD;
+		break;
+	case C5FrameState::IN_PAYLOAD:
+		if (c5_frame_pos < c5_frame_len) {
+			c5_frame_buf[c5_frame_pos++] = b;
+		}
+		if (c5_frame_pos == c5_frame_len) {
+			uint8_t cmd = c5_frame_buf[0];
+			c5_frame_dispatch(cmd, &c5_frame_buf[1], (uint16_t)(c5_frame_len - 1));
+			c5_frame_state = C5FrameState::IDLE;
+		}
+		break;
+	}
+}
+
+/* Drain bytes from the C5 scanner UART through the frame parser. */
 static void process_c5_uart(void)
 {
-	uint8_t chunk[C5_RING_BUF_SIZE];
-	size_t n = 0;
-
 	uint8_t byte;
-	while (n < sizeof(chunk) && ring_buf_get(&c5_ring_buf, &byte, 1) == 1) {
-		chunk[n++] = byte;
+	while (ring_buf_get(&c5_ring_buf, &byte, 1) == 1) {
+		c5_frame_feed_byte(byte);
 	}
-	if (n > 0) {
-		LOG_DBG("C5 UART: %u byte(s) (unparsed — TODO frame decode)", (unsigned)n);
+}
+
+/* Bench-test hook (increment 2, STEP 4): decode a hex-encoded frame from the
+ * CLI and feed it through the SAME c5_frame_feed_byte() state machine used
+ * for real UART bytes above — this exercises the actual framing code, not a
+ * parallel test-only shortcut. Invoked from process_cli_commands() on a
+ * `ridframe <hexbytes>` line, intercepted before CommonCLI ever sees it. */
+static void c5_ridframe_cli_cmd(const char *hex, char *reply, size_t reply_size)
+{
+	size_t hexlen = strlen(hex);
+	if (hexlen == 0 || (hexlen % 2) != 0) {
+		snprintf(reply, reply_size, "ridframe: bad hex length %u (must be even, nonzero)",
+			 (unsigned)hexlen);
+		return;
 	}
+
+	size_t nbytes = hexlen / 2;
+	uint8_t bytes[3 + sizeof(c5_frame_buf)];  /* marker + len16 + max frame payload */
+	if (nbytes > sizeof(bytes)) {
+		snprintf(reply, reply_size, "ridframe: %u bytes exceeds max %u",
+			 (unsigned)nbytes, (unsigned)sizeof(bytes));
+		return;
+	}
+
+	if (!mesh::Utils::fromHex(bytes, (int)nbytes, hex)) {
+		snprintf(reply, reply_size, "ridframe: invalid hex characters");
+		return;
+	}
+
+	for (size_t i = 0; i < nbytes; i++) {
+		c5_frame_feed_byte(bytes[i]);
+	}
+	snprintf(reply, reply_size, "ridframe: fed %u byte(s) to parser", (unsigned)nbytes);
 }
 
 #ifdef ZEPHCORE_LORA
@@ -271,7 +409,12 @@ static void process_cli_commands(CommonCLI *cli)
 	struct cli_cmd_line c;
 	while (cli && k_msgq_get(&cli_cmd_queue, &c, K_NO_WAIT) == 0) {
 		cli_reply_buf[0] = '\0';
-		cli->handleCommand(0, c.buf, cli_reply_buf);
+		if (memcmp(c.buf, "ridframe ", 9) == 0) {
+			/* Bench-test hook — see c5_ridframe_cli_cmd() above. */
+			c5_ridframe_cli_cmd(c.buf + 9, cli_reply_buf, sizeof(cli_reply_buf));
+		} else {
+			cli->handleCommand(0, c.buf, cli_reply_buf);
+		}
 		if (cli_reply_buf[0] != '\0') {
 			cli_print("\r\n  -> ");
 			cli_print(cli_reply_buf);
@@ -372,6 +515,7 @@ static void add_drone_base_contact(void)
 	if (!uart_companion_mesh.addContact(drone_base)) {
 		LOG_ERR("add_drone_base_contact: contact table full?!");
 	} else {
+		uart_companion_mesh.setDroneBaseContact(drone_base_pubkey);
 		LOG_INF("add_drone_base_contact: pinned drone-base contact added");
 	}
 }
