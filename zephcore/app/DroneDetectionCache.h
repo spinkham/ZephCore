@@ -16,8 +16,8 @@
  *   - a shared airtime token bucket sized for the pinned CR8 radio config,
  *   - packet-pool low-water backpressure (Telemetry sheds first, Identity has
  *     priority), and
- *   - a base-down breaker that suppresses Telemetry while the base is
- *     unreachable.
+ *   - a base-down breaker that throttles Telemetry to a slow recovery probe
+ *     (DDC_BASE_DOWN_PROBE_MS) while the base is unreachable.
  *
  * Delivery confirmation + retry stay in UartCompanionMesh's ACK table — this
  * module decides *whether new information is due to send*, the mesh decides
@@ -85,6 +85,16 @@
  * interval (MESHCORE_MIN_TELEMETRY_SPACING_MS). */
 #ifndef DDC_MIN_TELEMETRY_SPACING_MS
 #define DDC_MIN_TELEMETRY_SPACING_MS  5000u
+#endif
+
+/* Telemetry probe cadence while the base is down (isBaseDown()). Instead of
+ * fully suppressing Telemetry during an outage, throttle it to one send per
+ * this interval so a returning base gets an ACK — and clears the breaker —
+ * within one probe interval, rather than waiting up to the 5-min Identity
+ * keepalive. Still cuts >90% of the flood, and pool-safe (Telemetry is never
+ * retried). This bounds post-outage detection recovery to ~this interval. */
+#ifndef DDC_BASE_DOWN_PROBE_MS
+#define DDC_BASE_DOWN_PROBE_MS       30000u
 #endif
 
 /* Shared airtime budget: max airtime consumed in any rolling window

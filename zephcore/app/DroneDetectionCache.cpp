@@ -55,6 +55,11 @@ struct emit_event_t {
 static emit_event_t s_emit_log[TX_BUDGET_RING_LEN];
 static uint8_t      s_emit_log_count;   /* live entries (also = write head) */
 
+/* Last base-down Telemetry probe on the slot-less C5 relay path (gate_relay).
+ * The BLE path tracks the probe cadence per-slot; the relay path has no slot,
+ * so it gates off this single module-level timestamp instead. */
+static uint32_t s_last_relay_probe_ms;
+
 /* ----------------------------------------------------------------------------
  * Pure helpers ported from lib/meshcore_shared/src/meshcore_shared.h (they had
  * no Arduino dependency; only the id_data type changes to rid_id_data).
@@ -190,6 +195,7 @@ void drone_cache_init(void)
 	memset(&g_stats, 0, sizeof(g_stats));
 	memset(s_emit_log, 0, sizeof(s_emit_log));
 	s_emit_log_count = 0;
+	s_last_relay_probe_ms = 0;
 }
 
 rid_id_data *drone_cache_slot(const uint8_t mac[6], uint32_t now_ms)
@@ -267,11 +273,6 @@ bool drone_cache_gate(rid_id_data *uav, char kind, uint32_t now_ms,
 
 	if (kind == 'T') {
 		/* Telemetry: motion-tiered cadence, sheds first under load. */
-		if (base_down) {
-			g_stats.breaker_suppressed++;
-			return false;
-		}
-
 		float motion_m = 0.0f;
 		if (s.last_telemetry_sent_ms != 0) {
 			motion_m = approx_distance_m(s.last_emit_lat, s.last_emit_long,
@@ -293,11 +294,27 @@ bool drone_cache_gate(rid_id_data *uav, char kind, uint32_t now_ms,
 			: stationary   ? DDC_STATIONARY_INTERVAL_MS
 			:                DDC_NORMAL_INTERVAL_MS;
 
+		/* Base-down breaker: don't fully suppress Telemetry — override the
+		 * motion tier with the fixed probe cadence so a returning base gets an
+		 * ACK (which clears the breaker) within one probe interval instead of
+		 * waiting up to the 5-min Identity keepalive. Still ~1 send / probe
+		 * interval per drone (pool-safe, Telemetry never retried). */
+		if (base_down) {
+			interval = DDC_BASE_DOWN_PROBE_MS;
+		}
+
 		uint32_t since_last = (s.last_telemetry_sent_ms == 0)
 				      ? UINT32_MAX
 				      : (now_ms - s.last_telemetry_sent_ms);
 		if (since_last < interval) {
-			g_stats.telemetry_suppressed++;
+			/* Count outage-window holdbacks as breaker suppression so
+			 * `brk_supp` still reflects an engaged breaker; normal-load
+			 * cadence holdbacks stay telemetry_suppressed. */
+			if (base_down) {
+				g_stats.breaker_suppressed++;
+			} else {
+				g_stats.telemetry_suppressed++;
+			}
 			return false;
 		}
 		if (free_pool < DDC_POOL_RESERVE) {
@@ -326,7 +343,13 @@ bool drone_cache_gate_relay(char kind, uint32_t now_ms,
 	 * path only shares the airtime budget + backpressure + breaker so a
 	 * misbehaving C5 image (or a base outage) can't flood/wedge the mesh. */
 	if (kind == 'T') {
-		if (base_down) {
+		/* Base-down: throttle relay Telemetry to the probe cadence (gated off
+		 * a module-level timestamp — this path keeps no per-MAC slot) so a
+		 * returning base recovers within a probe interval, not the 5-min
+		 * Identity keepalive. */
+		if (base_down &&
+		    s_last_relay_probe_ms != 0 &&
+		    (now_ms - s_last_relay_probe_ms) < DDC_BASE_DOWN_PROBE_MS) {
 			g_stats.breaker_suppressed++;
 			return false;
 		}
@@ -336,6 +359,9 @@ bool drone_cache_gate_relay(char kind, uint32_t now_ms,
 		}
 		if (!tx_budget_take(now_ms, DDC_AIRTIME_TELEMETRY_MS)) {
 			return false;
+		}
+		if (base_down) {
+			s_last_relay_probe_ms = now_ms;
 		}
 		g_stats.telemetry_emitted++;
 		return true;
