@@ -10,12 +10,19 @@
  * the C5 detection-frame link (`zephcore,c5-uart` chosen node — see the
  * paired boards/common/uart_companion.overlay).
  *
- * SCOPE (increment 2 of 4): the C5 frame parser and CMD_RID_FORMATTED_MSG ->
+ * SCOPE (increment 3 of 4): the C5 frame parser and CMD_RID_FORMATTED_MSG ->
  * BaseChatMesh::sendMessage() path are implemented — see process_c5_uart()
- * and c5_frame_dispatch() below, and UartCompanionMesh::sendDetectionToBase().
- * CMD_RID_DETECTION (raw ODID) handling and ACK-driven retry are later
- * increments (dispatch logs and drops CMD_RID_DETECTION for now; a single
- * send + recorded expected-ack is as far as this increment goes).
+ * and c5_frame_dispatch() below — and detection-relay sends now get
+ * ACK-confirmed delivery with timeout retry: UartCompanionMesh::
+ * sendDetectionToBase() records a pending-send entry, checkTimeouts() (polled
+ * from MESH_EVENT_HOUSEKEEPING below) retries on ACK timeout up to
+ * UART_COMPANION_RETRY_LIMIT attempts, and processAck() confirms delivery.
+ * See the `ridstats` CLI command for the attempted/delivered/undelivered/
+ * retries counters. CMD_RID_DETECTION (raw ODID) handling is a later
+ * increment (dispatch logs and drops it for now); so is the dedup/rate-limit/
+ * motion-tier logic the Arduino carrier's drone_cache applies to that path —
+ * out of scope here since CMD_RID_FORMATTED_MSG text is already
+ * deduped/formatted by the C5.
  */
 
 #include <stdio.h>
@@ -403,6 +410,26 @@ static void c5_ridframe_cli_cmd(const char *hex, char *reply, size_t reply_size)
 }
 
 #ifdef ZEPHCORE_LORA
+/* Bench-test hook (increment 3, STEP 3): print detection-relay delivery
+ * stats — attempted/delivered/undelivered/retries counters plus the count
+ * of still-in-flight pending sends. `ridstats` takes no arguments;
+ * intercepted the same way as `ridframe` in process_cli_commands() below,
+ * before CommonCLI ever sees the line. */
+static void c5_ridstats_cli_cmd(char *reply, size_t reply_size)
+{
+	if (!uart_companion_mesh_ptr) {
+		snprintf(reply, reply_size, "ridstats: mesh not initialized");
+		return;
+	}
+	UartCompanionMesh::AckStats stats;
+	uart_companion_mesh_ptr->getAckStats(&stats);
+	int active = uart_companion_mesh_ptr->countActivePending();
+	snprintf(reply, reply_size,
+		 "ridstats: attempted=%u delivered=%u undelivered=%u retries=%u active_pending=%d",
+		 (unsigned)stats.attempted, (unsigned)stats.delivered,
+		 (unsigned)stats.undelivered, (unsigned)stats.retries, active);
+}
+
 /* Run queued CLI commands on the MAIN thread (mirrors main_repeater.cpp). */
 static void process_cli_commands(CommonCLI *cli)
 {
@@ -412,6 +439,9 @@ static void process_cli_commands(CommonCLI *cli)
 		if (memcmp(c.buf, "ridframe ", 9) == 0) {
 			/* Bench-test hook — see c5_ridframe_cli_cmd() above. */
 			c5_ridframe_cli_cmd(c.buf + 9, cli_reply_buf, sizeof(cli_reply_buf));
+		} else if (strcmp(c.buf, "ridstats") == 0) {
+			/* Bench-test hook — see c5_ridstats_cli_cmd() above. */
+			c5_ridstats_cli_cmd(cli_reply_buf, sizeof(cli_reply_buf));
 		} else {
 			cli->handleCommand(0, c.buf, cli_reply_buf);
 		}
@@ -623,6 +653,12 @@ static void uart_companion_event_loop(void)
 			if (uart_companion_mesh_ptr) {
 				uart_companion_mesh_ptr->maintenanceLoop();
 				uart_companion_mesh_ptr->loop();
+				/* Increment 3: age + retry detection-relay sends whose ACK
+				 * wait deadline has passed. Polled here (housekeeping tick,
+				 * CONFIG_ZEPHCORE_HOUSEKEEPING_INTERVAL_MS) rather than
+				 * driven off BaseChatMesh's single-slot onSendTimeout() —
+				 * see UartCompanionMesh::onSendTimeout()'s comment. */
+				uart_companion_mesh_ptr->checkTimeouts();
 			}
 #endif
 			ui_set_clock(rtc_clock.getCurrentTime());
