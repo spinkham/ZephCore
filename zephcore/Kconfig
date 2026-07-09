@@ -103,6 +103,18 @@ config ZEPHCORE_ROLE_ROOM_SERVER
 	  per-client sync cursor.  No BLE — configured via USB serial CLI.
 	  Reuses the repeater's ACL, region filtering and CLI command set.
 
+config ZEPHCORE_ROLE_UART_COMPANION
+	bool "UART Companion (C5 detection relay)"
+	help
+	  Headless companion variant for the carrier-v3 board: no BLE, no
+	  USB companion binary protocol, no contact/channel persistence.
+	  Reads ESP32-C5 Remote-ID detection frames over a dedicated UART
+	  (EUSART1 on XIAO MG24) and relays them as MeshCore TXT_MSGs
+	  directly to a pinned drone-base contact. A USB/console serial CLI
+	  is still available for bench diagnostics (shares helpers/CommonCLI
+	  with the repeater). Phase 2 bring-up skeleton: the C5-frame
+	  parse/send path is stubbed pending the wire-frame format.
+
 endchoice
 
 config ZEPHCORE_COMPANION_USB

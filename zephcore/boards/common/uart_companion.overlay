@@ -1,0 +1,31 @@
+/*
+ * SPDX-License-Identifier: MIT
+ * UART Companion role overlay — C5 detection-frame link.
+ *
+ * Auto-paired with uart_companion.conf by CMakeLists.txt's
+ * zephcore_auto_pair_overlay() (same directory, same base name — see the
+ * "Auto-pair user-supplied EXTRA_CONF_FILE entries" block).
+ *
+ * Enables EUSART1 (XIAO D6/D7 = PC6 TX / PC7 RX on XIAO MG24) as a plain
+ * UART and points the `zephcore,c5-uart` chosen node at it, so
+ * main_uart_companion.cpp can resolve the device via
+ * DEVICE_DT_GET(DT_CHOSEN(zephcore_c5_uart)) regardless of which board
+ * supplies the node.
+ *
+ * Today only XIAO MG24 defines an `eusart1` label (zephyr/boards/seeed/
+ * xiao_mg24/xiao_mg24.dts), disabled by default; EUSART0 already carries
+ * the SX1262 SPI bus on that board, so EUSART1-as-UART is uncontended.
+ * A board without an `eusart1` node cannot build this role/conf combo
+ * (unresolved label) — expected, since this is the only carrier-v3 target
+ * today.
+ */
+
+&eusart1 {
+	status = "okay";
+};
+
+/ {
+	chosen {
+		zephcore,c5-uart = &eusart1;
+	};
+};

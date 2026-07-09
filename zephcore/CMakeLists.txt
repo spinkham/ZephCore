@@ -657,6 +657,38 @@ elseif(CONFIG_ZEPHCORE_ROLE_OBSERVER)
     ${CMAKE_CURRENT_SOURCE_DIR}/app
   )
   target_compile_definitions(app PRIVATE ZEPHCORE_OBSERVER=1)
+elseif(CONFIG_ZEPHCORE_ROLE_UART_COMPANION)
+  message(STATUS "ZephCore Role: UART COMPANION (C5 detection relay)")
+  target_sources(app PRIVATE
+    src/main_uart_companion.cpp
+    app/UartCompanionMesh.cpp
+    adapters/datastore/ZephyrDataStore.cpp
+    helpers/BaseChatMesh.cpp
+    helpers/TransportKeyStore.cpp
+    helpers/CommonCLI.cpp
+  )
+  # Headless (no display/buttons/buzzer on the carrier-v3 target board), so the
+  # real ui_* implementation isn't compiled. main_uart_companion.cpp calls ui_*
+  # unconditionally (mirrors the repeater's boot/status sequence) — pull in the
+  # weak no-op stubs to satisfy the link. Mirrors the repeater branch above.
+  if(NOT CONFIG_ZEPHCORE_UI_DESIGN_BUTTON AND NOT CONFIG_ZEPHCORE_UI_DESIGN_JOYSTICK)
+    target_sources(app PRIVATE helpers/ui/ui_headless_stubs.c)
+    target_include_directories(app PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/helpers/ui
+    )
+  endif()
+  # Shared USBD CDC ACM init + 1200-baud DFU + DTR event/callback module.
+  # ESP32 boards use usb_serial, MG24 has no native USB device controller —
+  # both skip this when no CDC ACM class driver is present (mirrors repeater).
+  if(NOT CONFIG_CDC_ACM_SERIAL_INITIALIZE_AT_BOOT AND (CONFIG_USB_CDC_ACM OR CONFIG_USBD_CDC_ACM_CLASS))
+    target_sources(app PRIVATE
+      adapters/usb/ZephyrUSBCDC.cpp
+    )
+  endif()
+  target_include_directories(app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/adapters/usb
+  )
+  target_compile_definitions(app PRIVATE ZEPHCORE_UART_COMPANION=1)
 else()
   message(STATUS "ZephCore Role: COMPANION")
   target_sources(app PRIVATE
