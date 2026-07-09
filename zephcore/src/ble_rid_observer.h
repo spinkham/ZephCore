@@ -20,12 +20,23 @@
 
 class UartCompanionMesh;
 
-/* Registers the mesh instance used to relay parsed detections. Call once
- * during boot, before ble_rid_observer_start(). A null mesh is tolerated
- * (handle_astm() logs + drops instead of crashing) so the `bletest` CLI
- * bench hook still works even if called before boot finishes wiring the
- * mesh up — see main_uart_companion.cpp. */
-void ble_rid_observer_init(UartCompanionMesh *mesh);
+/* Registers the mesh instance used to relay parsed detections, plus a notify
+ * callback the scan callback fires (from the BT RX workqueue) to wake the main
+ * event loop when a detection has been queued. Call once during boot, before
+ * ble_rid_observer_start(). A null mesh is tolerated (handle_astm() logs +
+ * drops instead of crashing) so the `bletest` CLI bench hook still works even
+ * if called before boot finishes wiring the mesh up — see
+ * main_uart_companion.cpp. `notify` should post the loop's BLE-RX event bit. */
+void ble_rid_observer_init(UartCompanionMesh *mesh, void (*notify)(void));
+
+/* Drain BLE ASTM detections queued by the scan callback and run each through
+ * ble_rid_observer_handle_astm() ON THE CALLING THREAD. Call from the main
+ * event loop when the notify-posted BLE-RX event fires. The scan callback runs
+ * on the BT RX workqueue, whose stack overflows in the mesh send path, so it
+ * only enqueues the raw ODID body + MAC + RSSI; the parse/format/mesh-send work
+ * happens here — on the main thread's stack, and single-threaded with the rest
+ * of the mesh. Returns the number of detections processed this call. */
+int ble_rid_observer_process_pending(void);
 
 /* Enables the Zephyr BT stack (bt_enable, synchronous/blocking form) and
  * starts a passive BT_OBSERVER scan filtered for ASTM F3411 RemoteID

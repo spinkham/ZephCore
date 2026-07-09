@@ -133,13 +133,23 @@ static const uint8_t drone_base_pubkey[PUB_KEY_SIZE] = {
 #define MESH_EVENT_TX_DRAIN      BIT(4)  /* Outbound packet delay expired, run checkSend */
 #define MESH_EVENT_INIT_ADVERT   BIT(5)  /* Deferred boot advert — send on main thread */
 #define MESH_EVENT_C5_RX         BIT(6)  /* C5 UART bytes ready to drain */
+#define MESH_EVENT_BLE_RX        BIT(7)  /* BLE ASTM detection(s) queued by observer */
 #define MESH_EVENT_ALL           (MESH_EVENT_LORA_RX | MESH_EVENT_LORA_TX_DONE | \
 	MESH_EVENT_CLI_RX | MESH_EVENT_HOUSEKEEPING | MESH_EVENT_TX_DRAIN | \
-	MESH_EVENT_INIT_ADVERT | MESH_EVENT_C5_RX)
+	MESH_EVENT_INIT_ADVERT | MESH_EVENT_C5_RX | MESH_EVENT_BLE_RX)
 
 #define HOUSEKEEPING_INTERVAL_MS CONFIG_ZEPHCORE_HOUSEKEEPING_INTERVAL_MS
 
 static struct k_event mesh_events;
+
+/* BLE observer -> main loop wake. The observer's scan callback runs on the BT
+ * RX workqueue and only enqueues a detection; it calls this to wake the event
+ * loop, which drains the queue via ble_rid_observer_process_pending() on the
+ * main thread (where the stack + single-threaded mesh access are safe). */
+static void ble_notify(void)
+{
+	k_event_post(&mesh_events, MESH_EVENT_BLE_RX);
+}
 
 /* NOTE: main_repeater.cpp/main_companion.cpp also carry a deferred
  * hardware-RTC-write path (MESH_EVENT_RTC_SAVE / request_rtc_save()) because
@@ -698,6 +708,13 @@ static void uart_companion_event_loop(void)
 			process_c5_uart();
 		}
 
+		/* BLE Remote-ID observer — drain detections the BT RX workqueue
+		 * callback queued, running parse/format/send here on the main
+		 * thread (the BT RX WQ stack overflows in the mesh send path). */
+		if (events & MESH_EVENT_BLE_RX) {
+			ble_rid_observer_process_pending();
+		}
+
 		if (events & MESH_EVENT_HOUSEKEEPING) {
 #ifdef ZEPHCORE_LORA
 			if (uart_companion_mesh_ptr) {
@@ -804,7 +821,7 @@ int main(void)
 	 * send. Bring-up failure (BLE+LoRa coexistence on the MG24 is the real
 	 * risk here) is logged and does NOT block the rest of boot — the C5-UART
 	 * detection relay (increments 2-3) keeps working either way. */
-	ble_rid_observer_init(&uart_companion_mesh);
+	ble_rid_observer_init(&uart_companion_mesh, ble_notify);
 	if (!ble_rid_observer_start()) {
 		LOG_ERR("BLE observer failed to start — continuing without BLE RID scan");
 	}

@@ -48,6 +48,22 @@ static rid_id_data g_uav_table[MAX_TRACKED];
 
 static UartCompanionMesh *s_mesh;
 
+/* Wakes the main event loop after the scan callback queues a detection. Set by
+ * ble_rid_observer_init(); posts main_uart_companion.cpp's BLE-RX event bit. */
+static void (*s_notify)(void);
+
+/* One queued BLE ASTM detection handed from the scan callback (BT RX
+ * workqueue) to the main thread: the raw 25-byte ODID body + source MAC +
+ * RSSI. The heavy parse/format/mesh-send work must NOT run on the BT RX
+ * workqueue (its stack overflows in the mesh send path, and it would touch the
+ * mesh concurrently with the main loop), so we defer via this queue. */
+struct ble_astm_rec {
+	uint8_t mac[6];
+	int8_t  rssi;
+	uint8_t body[ASTM_ODID_BODY_LEN];
+};
+K_MSGQ_DEFINE(s_ble_astm_q, sizeof(struct ble_astm_rec), 16, 4);
+
 static uint32_t g_advs_total;
 static uint32_t g_astm_catches;
 
@@ -83,9 +99,10 @@ static rid_id_data *find_or_alloc_slot(const uint8_t mac[6])
 	return &g_uav_table[oldest_i];
 }
 
-void ble_rid_observer_init(UartCompanionMesh *mesh)
+void ble_rid_observer_init(UartCompanionMesh *mesh, void (*notify)(void))
 {
 	s_mesh = mesh;
+	s_notify = notify;
 	memset(g_uav_table, 0, sizeof(g_uav_table));
 	g_advs_total = 0;
 	g_astm_catches = 0;
@@ -145,6 +162,17 @@ void ble_rid_observer_handle_astm(const uint8_t *msg, uint16_t len, int8_t rssi,
 	}
 }
 
+int ble_rid_observer_process_pending(void)
+{
+	struct ble_astm_rec rec;
+	int n = 0;
+	while (k_msgq_get(&s_ble_astm_q, &rec, K_NO_WAIT) == 0) {
+		ble_rid_observer_handle_astm(rec.body, ASTM_ODID_BODY_LEN, rec.rssi, rec.mac);
+		n++;
+	}
+	return n;
+}
+
 namespace {
 
 struct ble_scan_ctx {
@@ -183,7 +211,19 @@ bool ble_ad_parse_cb(struct bt_data *data, void *user_data)
 		mac[i] = ctx->addr->a.val[5 - i];
 	}
 
-	ble_rid_observer_handle_astm(&data->data[4], (uint16_t)ASTM_ODID_BODY_LEN, ctx->rssi, mac);
+	/* Defer to the main loop: this runs on the BT RX workqueue, whose stack
+	 * overflows in the mesh send path, and running the send here would also
+	 * touch the mesh concurrently with the main loop. Enqueue the raw body +
+	 * MAC + RSSI and notify; ble_rid_observer_process_pending() does the
+	 * parse/format/send on the main thread. Drop (don't block) if the queue
+	 * is full — a missed advert is re-sent on the drone's next broadcast. */
+	struct ble_astm_rec rec;
+	memcpy(rec.mac, mac, sizeof(rec.mac));
+	rec.rssi = ctx->rssi;
+	memcpy(rec.body, &data->data[4], ASTM_ODID_BODY_LEN);
+	if (k_msgq_put(&s_ble_astm_q, &rec, K_NO_WAIT) == 0 && s_notify) {
+		s_notify();
+	}
 	return false;
 }
 
