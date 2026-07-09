@@ -658,14 +658,24 @@ elseif(CONFIG_ZEPHCORE_ROLE_OBSERVER)
   )
   target_compile_definitions(app PRIVATE ZEPHCORE_OBSERVER=1)
 elseif(CONFIG_ZEPHCORE_ROLE_UART_COMPANION)
-  message(STATUS "ZephCore Role: UART COMPANION (C5 detection relay)")
+  message(STATUS "ZephCore Role: UART COMPANION (C5 detection relay + BLE RID observer)")
   target_sources(app PRIVATE
     src/main_uart_companion.cpp
+    src/ble_rid_observer.cpp
     app/UartCompanionMesh.cpp
     adapters/datastore/ZephyrDataStore.cpp
     helpers/BaseChatMesh.cpp
     helpers/TransportKeyStore.cpp
     helpers/CommonCLI.cpp
+    lib/rid_odid/opendroneid.c
+    lib/rid_odid/rid_odid_format.cpp
+  )
+  # Increment 4: BLE Remote-ID observer's ODID parse/format path — hand-ported
+  # from lib/meshcore_shared (Arduino-dependent) into a standalone lib/rid_odid/
+  # (see lib/rid_odid/rid_odid.h for why). opendroneid.c/.h are a verbatim copy
+  # of nodes/remote_meshcore_node/src/opendroneid.{c,h} (portable C, no changes).
+  target_include_directories(app PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/lib/rid_odid
   )
   # Headless (no display/buttons/buzzer on the carrier-v3 target board), so the
   # real ui_* implementation isn't compiled. main_uart_companion.cpp calls ui_*

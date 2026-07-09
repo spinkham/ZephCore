@@ -4,10 +4,14 @@
  *
  * Phase 2 bring-up skeleton for the carrier-v3 board (XIAO MG24 + Wio-SX1262,
  * paired with an ESP32-C5 Remote-ID scanner over UART). A slim BaseChatMesh
- * subclass: no BLE, no USB companion binary protocol, no contact/channel
- * flash persistence. Its eventual job is to relay ESP32-C5 detection frames
- * (received over the `zephcore,c5-uart` UART — see main_uart_companion.cpp)
- * to a single pinned drone-base contact as MeshCore TXT_MSGs.
+ * subclass: no BLE companion protocol (NUS/phone pairing/GATT), no USB
+ * companion binary protocol, no contact/channel flash persistence. (The
+ * MG24's BLE radio IS used as of increment 4 — see ../src/ble_rid_observer.h
+ * — but purely as a passive RID-advert scanner, with zero involvement from
+ * this class's BaseChatMesh transport.) Its job is to relay detections
+ * (ESP32-C5 frames over the `zephcore,c5-uart` UART, or BLE RID adverts
+ * caught directly by this board) to a single pinned drone-base contact as
+ * MeshCore TXT_MSGs.
  *
  * Modeled on app/CompanionMesh.{h,cpp} — see that file for the fuller
  * BLE-companion implementation of each hook this class stubs minimally.

@@ -1,14 +1,13 @@
 /*
  * SPDX-License-Identifier: MIT
- * ZephCore - UART Companion (C5 detection relay, Event-Driven)
+ * ZephCore - UART Companion (C5 detection relay + BLE RID observer, Event-Driven)
  *
- * Phase 2 bring-up skeleton for the carrier-v3 board (XIAO MG24 +
- * Wio-SX1262, paired over UART with an ESP32-C5 Remote-ID scanner).
- * Headless, no BLE — modeled closely on src/main_repeater.cpp (same
- * boot sequence, USB/console serial CLI, event-driven mesh loop), with
- * RepeaterMesh swapped for UartCompanionMesh and a second UART added for
- * the C5 detection-frame link (`zephcore,c5-uart` chosen node — see the
- * paired boards/common/uart_companion.overlay).
+ * Bring-up for the carrier-v3 board (XIAO MG24 + Wio-SX1262, paired over
+ * UART with an ESP32-C5 Remote-ID scanner). Modeled closely on
+ * src/main_repeater.cpp (same boot sequence, USB/console serial CLI,
+ * event-driven mesh loop), with RepeaterMesh swapped for UartCompanionMesh
+ * and a second UART added for the C5 detection-frame link (`zephcore,c5-uart`
+ * chosen node — see the paired boards/common/uart_companion.overlay).
  *
  * SCOPE (increment 3 of 4): the C5 frame parser and CMD_RID_FORMATTED_MSG ->
  * BaseChatMesh::sendMessage() path are implemented — see process_c5_uart()
@@ -23,6 +22,13 @@
  * motion-tier logic the Arduino carrier's drone_cache applies to that path —
  * out of scope here since CMD_RID_FORMATTED_MSG text is already
  * deduped/formatted by the C5.
+ *
+ * SCOPE (increment 4 of 4): the MG24's own BLE radio now runs as a
+ * BT_OBSERVER (passive scan, no connections/GATT/pairing — see
+ * boards/common/uart_companion.conf) that catches ASTM F3411 RemoteID BLE
+ * adverts directly and relays them through the SAME sendDetectionToBase()
+ * path as the C5-UART relay. See ble_rid_observer.{h,cpp} and the
+ * `bletest <hex>` bench CLI hook below.
  */
 
 #include <stdio.h>
@@ -42,10 +48,12 @@ LOG_MODULE_REGISTER(zephcore_uart_companion_main, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL
 #include <zephyr/sys/reboot.h>
 #include "oled_power.h"
 
-/* BLE controller assert handler — some platform confs (e.g. mg24_common.conf)
- * enable CONFIG_BT_CTLR_ASSERT_HANDLER regardless of role; harmless no-op
- * when CONFIG_BT=n (this role's uart_companion.conf disables BT). Mirrors
- * main_repeater.cpp. */
+/* BLE controller assert handler — mg24_common.conf enables
+ * CONFIG_BT_CTLR_ASSERT_HANDLER regardless of role. As of increment 4 this
+ * role runs BLE (BT_OBSERVER — see boards/common/uart_companion.conf), so
+ * this is now LIVE, not a no-op: a Silabs controller assert reboots the
+ * board rather than silently freezing at highest IRQ priority. Mirrors
+ * main_repeater.cpp / main_companion.cpp's identical handler. */
 #if IS_ENABLED(CONFIG_BT_CTLR_ASSERT_HANDLER)
 extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
 {
@@ -81,6 +89,11 @@ extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
 /* Radio + mesh includes (shared header selects LR1110 or SX126x) */
 #include <mesh/RadioIncludes.h>
 #include <mesh/Utils.h>  /* mesh::Utils::fromHex — used by the ridframe bench CLI hook */
+
+/* BLE Remote-ID observer (increment 4 of 4) — MG24's own BLE radio scans
+ * for ASTM F3411 adverts and relays them via the same sendDetectionToBase()
+ * path the C5-UART detection relay uses. See ble_rid_observer.h. */
+#include "ble_rid_observer.h"
 
 /* LED configuration */
 #if DT_NODE_HAS_PROP(DT_ALIAS(led0), gpios)
@@ -430,6 +443,40 @@ static void c5_ridstats_cli_cmd(char *reply, size_t reply_size)
 		 (unsigned)stats.undelivered, (unsigned)stats.retries, active);
 }
 
+/* Bench-test hook (increment 4, STEP 4): decode a hex-encoded raw ASTM ODID
+ * message body from the CLI and feed it straight into
+ * ble_rid_observer_handle_astm() (with a dummy mac/rssi) — exercises the
+ * exact same ODID-parse -> format -> sendDetectionToBase() path a live
+ * scan_cb() match would use, without a real RID broadcaster on the bench.
+ * Invoked from process_cli_commands() on a `bletest <hexbytes>` line,
+ * intercepted before CommonCLI ever sees it — same pattern as `ridframe`. */
+static void ble_bletest_cli_cmd(const char *hex, char *reply, size_t reply_size)
+{
+	size_t hexlen = strlen(hex);
+	if (hexlen == 0 || (hexlen % 2) != 0) {
+		snprintf(reply, reply_size, "bletest: bad hex length %u (must be even, nonzero)",
+			 (unsigned)hexlen);
+		return;
+	}
+
+	size_t nbytes = hexlen / 2;
+	uint8_t bytes[64]; /* plenty for a 25-byte ODID body */
+	if (nbytes > sizeof(bytes)) {
+		snprintf(reply, reply_size, "bletest: %u bytes exceeds max %u", (unsigned)nbytes,
+			 (unsigned)sizeof(bytes));
+		return;
+	}
+
+	if (!mesh::Utils::fromHex(bytes, (int)nbytes, hex)) {
+		snprintf(reply, reply_size, "bletest: invalid hex characters");
+		return;
+	}
+
+	static const uint8_t dummy_mac[6] = {0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01};
+	ble_rid_observer_handle_astm(bytes, (uint16_t)nbytes, /*rssi=*/-50, dummy_mac);
+	snprintf(reply, reply_size, "bletest: fed %u byte(s) to ASTM handler", (unsigned)nbytes);
+}
+
 /* Run queued CLI commands on the MAIN thread (mirrors main_repeater.cpp). */
 static void process_cli_commands(CommonCLI *cli)
 {
@@ -442,6 +489,9 @@ static void process_cli_commands(CommonCLI *cli)
 		} else if (strcmp(c.buf, "ridstats") == 0) {
 			/* Bench-test hook — see c5_ridstats_cli_cmd() above. */
 			c5_ridstats_cli_cmd(cli_reply_buf, sizeof(cli_reply_buf));
+		} else if (memcmp(c.buf, "bletest ", 8) == 0) {
+			/* Bench-test hook — see ble_bletest_cli_cmd() above. */
+			ble_bletest_cli_cmd(c.buf + 8, cli_reply_buf, sizeof(cli_reply_buf));
 		} else {
 			cli->handleCommand(0, c.buf, cli_reply_buf);
 		}
@@ -748,6 +798,16 @@ int main(void)
 	lora_radio.enableRxDutyCycle(prefs->rx_duty_cycle != 0);
 
 	add_drone_base_contact();
+
+	/* BLE Remote-ID observer (increment 4 of 4) — wire the mesh in first so
+	 * a scan match arriving immediately after bt_enable() has somewhere to
+	 * send. Bring-up failure (BLE+LoRa coexistence on the MG24 is the real
+	 * risk here) is logged and does NOT block the rest of boot — the C5-UART
+	 * detection relay (increments 2-3) keeps working either way. */
+	ble_rid_observer_init(&uart_companion_mesh);
+	if (!ble_rid_observer_start()) {
+		LOG_ERR("BLE observer failed to start — continuing without BLE RID scan");
+	}
 
 	ui_set_node_name(prefs->node_name);
 	ui_set_radio_params(
