@@ -38,6 +38,14 @@ void ble_rid_observer_init(UartCompanionMesh *mesh, void (*notify)(void));
  * of the mesh. Returns the number of detections processed this call. */
 int ble_rid_observer_process_pending(void);
 
+/* Scanner-side catch counters for the `ridstats` bench CLI. `advs_total` = every
+ * BLE advert the scan callback saw; `astm_catches` = how many were ASTM F3411
+ * RemoteID service-data matches. astm_catches / (a known broadcaster's advert
+ * count over the same window) is the BLE detection yield. Either pointer may be
+ * NULL. */
+void ble_rid_observer_get_counts(uint32_t *advs_total, uint32_t *astm_catches,
+				 uint32_t *ext_advs);
+
 /* Enables the Zephyr BT stack (bt_enable, synchronous/blocking form) and
  * starts a passive BT_OBSERVER scan filtered for ASTM F3411 RemoteID
  * service-data adverts (UUID 0xFFFA, app code 0x0D — see

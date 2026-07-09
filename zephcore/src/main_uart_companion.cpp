@@ -447,10 +447,14 @@ static void c5_ridstats_cli_cmd(char *reply, size_t reply_size)
 	UartCompanionMesh::AckStats stats;
 	uart_companion_mesh_ptr->getAckStats(&stats);
 	int active = uart_companion_mesh_ptr->countActivePending();
+	uint32_t ble_advs = 0, ble_astm = 0, ble_ext = 0;
+	ble_rid_observer_get_counts(&ble_advs, &ble_astm, &ble_ext);
 	snprintf(reply, reply_size,
-		 "ridstats: attempted=%u delivered=%u undelivered=%u retries=%u active_pending=%d",
+		 "ridstats: attempted=%u delivered=%u undelivered=%u retries=%u active_pending=%d "
+		 "ble_advs=%u ble_astm=%u ble_ext=%u",
 		 (unsigned)stats.attempted, (unsigned)stats.delivered,
-		 (unsigned)stats.undelivered, (unsigned)stats.retries, active);
+		 (unsigned)stats.undelivered, (unsigned)stats.retries, active,
+		 (unsigned)ble_advs, (unsigned)ble_astm, (unsigned)ble_ext);
 }
 
 /* Bench-test hook (increment 4, STEP 4): decode a hex-encoded raw ASTM ODID

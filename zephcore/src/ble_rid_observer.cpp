@@ -66,6 +66,10 @@ K_MSGQ_DEFINE(s_ble_astm_q, sizeof(struct ble_astm_rec), 16, 4);
 
 static uint32_t g_advs_total;
 static uint32_t g_astm_catches;
+/* Of g_advs_total, how many carried the BLE5 extended-advertising property
+ * (info->adv_props & BT_GAP_ADV_PROP_EXT_ADV). A nonzero value proves the
+ * observer is receiving ext-adv PDUs, not just legacy — surfaced in ridstats. */
+static uint32_t g_ext_advs;
 
 /* Log an advert-count line at DBG every N adverts so a bench operator can
  * confirm the radio is actually scanning even with no ASTM broadcaster
@@ -106,6 +110,7 @@ void ble_rid_observer_init(UartCompanionMesh *mesh, void (*notify)(void))
 	memset(g_uav_table, 0, sizeof(g_uav_table));
 	g_advs_total = 0;
 	g_astm_catches = 0;
+	g_ext_advs = 0;
 }
 
 void ble_rid_observer_handle_astm(const uint8_t *msg, uint16_t len, int8_t rssi,
@@ -173,6 +178,20 @@ int ble_rid_observer_process_pending(void)
 	return n;
 }
 
+void ble_rid_observer_get_counts(uint32_t *advs_total, uint32_t *astm_catches,
+				 uint32_t *ext_advs)
+{
+	if (advs_total) {
+		*advs_total = g_advs_total;
+	}
+	if (astm_catches) {
+		*astm_catches = g_astm_catches;
+	}
+	if (ext_advs) {
+		*ext_advs = g_ext_advs;
+	}
+}
+
 namespace {
 
 struct ble_scan_ctx {
@@ -227,20 +246,31 @@ bool ble_ad_parse_cb(struct bt_data *data, void *user_data)
 	return false;
 }
 
-void ble_scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
-		  struct net_buf_simple *buf)
+/* New-style scan-recv callback, registered via bt_le_scan_cb_register(). Unlike
+ * the legacy bt_le_scan_start(param, cb) callback, this one is delivered BOTH
+ * legacy AND extended (BLE5) advertising reports, so the observer catches
+ * ext-adv RemoteID broadcasters too (CONFIG_BT_EXT_ADV=y in uart_companion.conf).
+ * info->adv_props' EXT_ADV bit distinguishes them for the coverage readout. */
+void ble_scan_recv_cb(const struct bt_le_scan_recv_info *info,
+		       struct net_buf_simple *buf)
 {
-	ARG_UNUSED(adv_type);
-
 	g_advs_total++;
+	if (info->adv_props & BT_GAP_ADV_PROP_EXT_ADV) {
+		g_ext_advs++;
+	}
 	if ((g_advs_total % ADV_COUNT_LOG_INTERVAL) == 0) {
-		LOG_DBG("BLE scan liveness: %u adverts seen, %u ASTM catches",
-			(unsigned)g_advs_total, (unsigned)g_astm_catches);
+		LOG_DBG("BLE scan liveness: %u adverts (%u ext), %u ASTM catches",
+			(unsigned)g_advs_total, (unsigned)g_ext_advs,
+			(unsigned)g_astm_catches);
 	}
 
-	ble_scan_ctx ctx = {addr, rssi};
+	ble_scan_ctx ctx = {info->addr, info->rssi};
 	bt_data_parse(buf, ble_ad_parse_cb, &ctx);
 }
+
+static struct bt_le_scan_cb s_scan_cbs = {
+	.recv = ble_scan_recv_cb,
+};
 
 } /* anonymous namespace */
 
@@ -270,16 +300,21 @@ bool ble_rid_observer_start(void)
 	 * (detection capability first) — every RID scanner elsewhere in this
 	 * project (WiFi NAN/beacon, nRF52 Bluefruit BLE) reports every
 	 * matching packet uncached, so this role matches that. */
+	/* Register the new-style recv callback (receives legacy + extended) BEFORE
+	 * starting the scan; pass NULL as the legacy cb to bt_le_scan_start so only
+	 * the registered callback fires (no double-delivery). */
+	bt_le_scan_cb_register(&s_scan_cbs);
+
 	static const struct bt_le_scan_param astm_scan_param = BT_LE_SCAN_PARAM_INIT(
 		BT_LE_SCAN_TYPE_PASSIVE, BT_LE_SCAN_OPT_NONE, BT_GAP_SCAN_FAST_INTERVAL,
 		BT_GAP_SCAN_FAST_WINDOW);
 
-	err = bt_le_scan_start(&astm_scan_param, ble_scan_cb);
+	err = bt_le_scan_start(&astm_scan_param, NULL);
 	if (err) {
 		LOG_ERR("BLE observer: bt_le_scan_start failed (err %d)", err);
 		return false;
 	}
 
-	LOG_INF("BLE observer started");
+	LOG_INF("BLE observer started (ext-adv scan: legacy + BLE5)");
 	return true;
 }
