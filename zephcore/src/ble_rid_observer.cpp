@@ -18,6 +18,7 @@ LOG_MODULE_REGISTER(zephcore_ble_rid_observer, CONFIG_ZEPHCORE_MAIN_LOG_LEVEL);
 
 #include "rid_odid.h"
 #include <app/UartCompanionMesh.h>
+#include <app/DroneDetectionCache.h>
 
 /* ASTM F3411 BLE service-data identifiers — ported from
  * nodes/nrf52_ble_scanner/src/main.cpp:39-42 (the project's existing
@@ -36,16 +37,15 @@ static constexpr size_t  ASTM_ODID_BODY_LEN = 25;
 /* uuid(2) + app_code(1) + msg_counter(1) + odid_body(25) */
 static constexpr size_t  ASTM_SVC_DATA_MIN_LEN = 2 + 1 + 1 + ASTM_ODID_BODY_LEN;
 
-/* Per-MAC ODID accumulation slots — ported from nrf52_ble_scanner's
- * g_uav_table / find_or_alloc_slot() (main.cpp:54-80). ASTM spreads Identity
- * fields (UASID, operator ID, aircraft type...) across up to 5 message
- * types per drone; without accumulation, a Location-only advert would
- * format an all-empty Identity. No rate-limit/dedup/motion-tier logic here
- * — that's the nRF52 Arduino carrier's drone_cache.cpp, explicitly out of
- * scope for this increment (see CLAUDE.md "increment 4 of 4" scope note). */
-#define MAX_TRACKED 4
-static rid_id_data g_uav_table[MAX_TRACKED];
-
+/* Per-MAC ODID accumulation now lives in the shared DroneDetectionCache
+ * (app/DroneDetectionCache.{h,cpp}) so both the BLE observer and the C5-UART
+ * relay converge on one per-MAC cache. ASTM spreads Identity fields (UASID,
+ * operator ID, aircraft type...) across up to 5 message types per drone;
+ * without accumulation, a Location-only advert would format an all-empty
+ * Identity. drone_cache_slot() returns the per-MAC accumulator; the rate-limit
+ * / dedup / motion-tier / airtime-budget gating that this observer used to do
+ * unthrottled (the mesh flood source) is now applied by drone_cache_gate()
+ * before each send — see docs/carrier-v3-write-combining.md. */
 static UartCompanionMesh *s_mesh;
 
 /* Wakes the main event loop after the scan callback queues a detection. Set by
@@ -76,38 +76,12 @@ static uint32_t g_ext_advs;
  * present (ambient phone/laptop BLE adverts are enough to tick this). */
 static constexpr uint32_t ADV_COUNT_LOG_INTERVAL = 25;
 
-static rid_id_data *find_or_alloc_slot(const uint8_t mac[6])
-{
-	static const uint8_t zero_mac[6] = {0};
-
-	for (int i = 0; i < MAX_TRACKED; i++) {
-		if (memcmp(g_uav_table[i].mac, mac, 6) == 0) {
-			return &g_uav_table[i];
-		}
-	}
-	for (int i = 0; i < MAX_TRACKED; i++) {
-		if (memcmp(g_uav_table[i].mac, zero_mac, 6) == 0) {
-			return &g_uav_table[i];
-		}
-	}
-	/* LRU eviction */
-	uint32_t oldest = UINT32_MAX;
-	int oldest_i = 0;
-	for (int i = 0; i < MAX_TRACKED; i++) {
-		if (g_uav_table[i].last_seen < oldest) {
-			oldest = g_uav_table[i].last_seen;
-			oldest_i = i;
-		}
-	}
-	memset(&g_uav_table[oldest_i], 0, sizeof(rid_id_data));
-	return &g_uav_table[oldest_i];
-}
-
 void ble_rid_observer_init(UartCompanionMesh *mesh, void (*notify)(void))
 {
 	s_mesh = mesh;
 	s_notify = notify;
-	memset(g_uav_table, 0, sizeof(g_uav_table));
+	/* The per-MAC accumulation slots live in the DroneDetectionCache now;
+	 * main_uart_companion.cpp calls drone_cache_init() at boot. */
 	g_advs_total = 0;
 	g_astm_catches = 0;
 	g_ext_advs = 0;
@@ -126,9 +100,8 @@ void ble_rid_observer_handle_astm(const uint8_t *msg, uint16_t len, int8_t rssi,
 	snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x", mac6[0], mac6[1],
 		  mac6[2], mac6[3], mac6[4], mac6[5]);
 
-	rid_id_data *uav = find_or_alloc_slot(mac6);
-	memcpy(uav->mac, mac6, 6);
-	uav->last_seen = (uint32_t)k_uptime_get();
+	uint32_t now = (uint32_t)k_uptime_get();
+	rid_id_data *uav = drone_cache_slot(mac6, now);
 	uav->rssi = rssi;
 	uav->band = RID_BAND_BLE;
 	uav->channel = 0;
@@ -136,6 +109,12 @@ void ble_rid_observer_handle_astm(const uint8_t *msg, uint16_t len, int8_t rssi,
 	uint8_t msg_type = msg[0] & 0xF0;
 	rid_odid_parse_ble_message(uav, msg);
 	g_astm_catches++;
+
+	/* The write-combining gate needs the mesh's live packet-pool depth and
+	 * base-reachability so it can shed Telemetry (Identity keeps priority)
+	 * before the pool starves or airtime saturates. */
+	int  free_pool = s_mesh ? s_mesh->getFreePoolCount() : 0;
+	bool base_down = s_mesh ? s_mesh->isBaseDown() : false;
 
 	if (msg_type == 0x00) {
 		char text[160];
@@ -146,6 +125,8 @@ void ble_rid_observer_handle_astm(const uint8_t *msg, uint16_t len, int8_t rssi,
 			LOG_WRN("handle_astm_ble: Identity format failed, dropping");
 		} else if (!s_mesh) {
 			LOG_WRN("handle_astm_ble: mesh not initialized, dropping Identity");
+		} else if (!drone_cache_gate(uav, 'I', now, free_pool, base_down)) {
+			LOG_DBG("handle_astm_ble: Identity throttled by cache");
 		} else {
 			s_mesh->sendDetectionToBase(text);
 		}
@@ -158,6 +139,8 @@ void ble_rid_observer_handle_astm(const uint8_t *msg, uint16_t len, int8_t rssi,
 			LOG_WRN("handle_astm_ble: Telemetry format failed, dropping");
 		} else if (!s_mesh) {
 			LOG_WRN("handle_astm_ble: mesh not initialized, dropping Telemetry");
+		} else if (!drone_cache_gate(uav, 'T', now, free_pool, base_down)) {
+			LOG_DBG("handle_astm_ble: Telemetry throttled by cache");
 		} else {
 			s_mesh->sendDetectionToBase(text);
 		}

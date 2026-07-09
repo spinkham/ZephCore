@@ -95,6 +95,11 @@ extern "C" void bt_ctlr_assert_handle(char *file, uint32_t line)
  * path the C5-UART detection relay uses. See ble_rid_observer.h. */
 #include "ble_rid_observer.h"
 
+/* Detection-relay write-combining gate (airtime throttle / dedup / backpressure)
+ * — both the BLE observer and the C5 FORMATTED_MSG relay pass detections
+ * through this before sendDetectionToBase(). See app/DroneDetectionCache.h. */
+#include <app/DroneDetectionCache.h>
+
 /* LED configuration */
 #if DT_NODE_HAS_PROP(DT_ALIAS(led0), gpios)
 #define LED0_NODE DT_ALIAS(led0)
@@ -163,7 +168,9 @@ static const struct device *usb_dev;
 static uint8_t usb_ring_buf_data[USB_RING_BUF_SIZE];
 static struct ring_buf usb_ring_buf;
 static char cli_line_buf[CLI_LINE_BUF_SIZE];
-static char cli_reply_buf[256];
+/* Sized for the extended `ridstats` line (ack + BLE catch + DroneDetectionCache
+ * counters); also the scratch buffer CommonCLI writes replies into. */
+static char cli_reply_buf[384];
 static uint16_t cli_line_idx;
 
 struct cli_cmd_line { char buf[CLI_LINE_BUF_SIZE]; };
@@ -334,7 +341,20 @@ static void c5_frame_dispatch(uint8_t cmd, const uint8_t *payload, uint16_t len)
 		LOG_INF("C5 frame: FORMATTED_MSG len=%d -> send", (int)text_len);
 #ifdef ZEPHCORE_LORA
 		if (uart_companion_mesh_ptr) {
-			uart_companion_mesh_ptr->sendDetectionToBase(text);
+			/* Backstop gate: the C5 already per-MAC-throttles this text, so
+			 * run it through the coarse relay gate (shared airtime budget +
+			 * pool backpressure + base-down breaker only, no per-MAC slot)
+			 * to defend the mesh against a misbehaving C5 image or a base
+			 * outage. text[0] is the 'I'/'T' kind prefix. */
+			uint32_t now = (uint32_t)k_uptime_get();
+			int  free_pool = uart_companion_mesh_ptr->getFreePoolCount();
+			bool base_down = uart_companion_mesh_ptr->isBaseDown();
+			if (text_len > 0 &&
+			    drone_cache_gate_relay(text[0], now, free_pool, base_down)) {
+				uart_companion_mesh_ptr->sendDetectionToBase(text);
+			} else {
+				LOG_DBG("C5 frame: FORMATTED_MSG throttled by cache");
+			}
 		}
 #endif
 		break;
@@ -449,12 +469,23 @@ static void c5_ridstats_cli_cmd(char *reply, size_t reply_size)
 	int active = uart_companion_mesh_ptr->countActivePending();
 	uint32_t ble_advs = 0, ble_astm = 0, ble_ext = 0;
 	ble_rid_observer_get_counts(&ble_advs, &ble_astm, &ble_ext);
+	struct drone_cache_stats cs;
+	drone_cache_get_stats(&cs);
 	snprintf(reply, reply_size,
 		 "ridstats: attempted=%u delivered=%u undelivered=%u retries=%u active_pending=%d "
-		 "ble_advs=%u ble_astm=%u ble_ext=%u",
+		 "no_ack=%u ble_advs=%u ble_astm=%u ble_ext=%u "
+		 "id_emit=%u id_supp=%u tel_emit=%u tel_supp=%u budget_skip=%u bp_skip=%u "
+		 "brk_supp=%u air_ms=%u/%u slots=%u",
 		 (unsigned)stats.attempted, (unsigned)stats.delivered,
 		 (unsigned)stats.undelivered, (unsigned)stats.retries, active,
-		 (unsigned)ble_advs, (unsigned)ble_astm, (unsigned)ble_ext);
+		 (unsigned)uart_companion_mesh_ptr->getConsecutiveNoAck(),
+		 (unsigned)ble_advs, (unsigned)ble_astm, (unsigned)ble_ext,
+		 (unsigned)cs.identity_emitted, (unsigned)cs.identity_suppressed,
+		 (unsigned)cs.telemetry_emitted, (unsigned)cs.telemetry_suppressed,
+		 (unsigned)cs.budget_skipped, (unsigned)cs.backpressure_skipped,
+		 (unsigned)cs.breaker_suppressed,
+		 (unsigned)cs.cur_airtime_ms, (unsigned)DDC_TX_BUDGET_AIRTIME_MS,
+		 (unsigned)cs.slots_used);
 }
 
 /* Bench-test hook (increment 4, STEP 4): decode a hex-encoded raw ASTM ODID
@@ -805,6 +836,10 @@ int main(void)
 
 	uart_companion_mesh.begin();
 
+	/* Prime the packet pool so the write-combining cache's backpressure gate
+	 * sees the real free depth from boot (not 0 until the first mesh alloc). */
+	uart_companion_mesh.primePacketPool();
+
 	NodePrefs *prefs = uart_companion_mesh.getNodePrefs();
 	if (strlen(prefs->node_name) == 0) {
 		uint8_t dev_id[8];
@@ -819,6 +854,11 @@ int main(void)
 	lora_radio.enableRxDutyCycle(prefs->rx_duty_cycle != 0);
 
 	add_drone_base_contact();
+
+	/* Detection-relay write-combining cache — zero its slots/budget/counters
+	 * before either the BLE observer or the C5 UART link can feed detections
+	 * into drone_cache_gate()/_relay(). */
+	drone_cache_init();
 
 	/* BLE Remote-ID observer (increment 4 of 4) — wire the mesh in first so
 	 * a scan match arriving immediately after bt_enable() has somewhere to

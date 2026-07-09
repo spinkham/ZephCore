@@ -663,6 +663,7 @@ elseif(CONFIG_ZEPHCORE_ROLE_UART_COMPANION)
     src/main_uart_companion.cpp
     src/ble_rid_observer.cpp
     app/UartCompanionMesh.cpp
+    app/DroneDetectionCache.cpp
     adapters/datastore/ZephyrDataStore.cpp
     helpers/BaseChatMesh.cpp
     helpers/TransportKeyStore.cpp

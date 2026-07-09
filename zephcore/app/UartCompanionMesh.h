@@ -45,6 +45,13 @@
  * sync if that constant ever changes. */
 #define UART_COMPANION_TEXT_MAX 151
 
+/* Consecutive missed ACKs (across Identity + Telemetry) after which isBaseDown()
+ * flips true — the DroneDetectionCache then suppresses Telemetry and lets only
+ * Identity keepalive through until an ACK returns. Hand-ported literal of
+ * MESHCORE_NO_ACK_FALLBACK_THRESHOLD (lib/meshcore_shared/src/meshcore_shared.h,
+ * =6) — same reason the retry-limit constant above is hand-ported. */
+#define UART_COMPANION_NO_ACK_THRESHOLD 6
+
 class UartCompanionMesh : public BaseChatMesh {
 public:
 	UartCompanionMesh(mesh::Radio &radio, mesh::MillisecondClock &ms, mesh::RNG &rng,
@@ -106,12 +113,32 @@ public:
 	void getAckStats(AckStats *out) const;
 	int countActivePending() const;
 
+	/* Live free depth of the shared StaticPoolPacketManager pool (POOL_SIZE
+	 * = 32). The DroneDetectionCache gate reads this to shed detection sends
+	 * before the pool starves — leaving room for adverts/ACKs/retries even
+	 * under a detection flood. See docs/carrier-v3-write-combining.md §4. */
+	int getFreePoolCount() const;
+
+	/* Force the StaticPoolPacketManager's lazy pool init so getFreePoolCount()
+	 * reports the true free depth (POOL_SIZE) from boot instead of 0 until the
+	 * mesh happens to allocate its first packet — otherwise the cache's
+	 * backpressure gate would spuriously shed detections in the first seconds
+	 * after boot. Call once during setup, after begin(). */
+	void primePacketPool();
+
+	/* True once UART_COMPANION_NO_ACK_THRESHOLD consecutive detection sends
+	 * have gone un-ACKed — the base-down signal the cache uses to suppress
+	 * Telemetry and fall back to Identity-only keepalive. Resets on the next
+	 * confirmed ACK (processAck). */
+	bool isBaseDown() const { return _consecutive_no_ack >= UART_COMPANION_NO_ACK_THRESHOLD; }
+	uint32_t getConsecutiveNoAck() const { return _consecutive_no_ack; }
+
 	/* Pending-send tracking (model: CompanionMesh::addPendingAck/
 	 * findAndRemoveAck, extended with what a retry needs). contact_idx is
 	 * whatever sendMessage's caller wants to recover in processAck() — the
 	 * Phase 2/3 sender passes the drone-base contact's index. */
 	void addPendingSend(const char *text, uint8_t attempt, uint32_t expected,
-		int contact_idx, uint32_t deadline_ms);
+		int contact_idx, uint32_t deadline_ms, bool identity);
 	int findAndRemoveAck(uint32_t ack);
 
 protected:
@@ -145,10 +172,20 @@ private:
 		uint32_t expected_ack;
 		int contact_idx;
 		uint32_t deadline_ms;
+		/* Identity ('I') sends get the retry budget; Telemetry ('T') is
+		 * retired on the first ACK timeout (the next cadence interval
+		 * re-sends similar data — retrying it just pins the packet pool).
+		 * See docs/carrier-v3-write-combining.md §5. */
+		bool identity;
 	};
 	PendingSend _ack_table[UART_COMPANION_ACK_TABLE_SIZE];
 	int _ack_next_overwrite;
 	AckStats _ack_stats;
+
+	/* Consecutive un-ACKed detection sends; drives isBaseDown(). Bumped on
+	 * each ACK-wait timeout in checkTimeouts(), cleared on any confirmed ACK
+	 * in processAck(). */
+	uint32_t _consecutive_no_ack;
 
 	uint8_t _drone_base_pubkey[PUB_KEY_SIZE];
 	bool _drone_base_pubkey_set;

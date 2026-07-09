@@ -24,6 +24,27 @@ UartCompanionMesh::UartCompanionMesh(mesh::Radio &radio, mesh::MillisecondClock 
 	memset(&_ack_stats, 0, sizeof(_ack_stats));
 	memset(_drone_base_pubkey, 0, sizeof(_drone_base_pubkey));
 	_drone_base_pubkey_set = false;
+	_consecutive_no_ack = 0;
+}
+
+int UartCompanionMesh::getFreePoolCount() const
+{
+	/* _mgr is the protected PacketManager* inherited from mesh::Dispatcher;
+	 * getFreeCount() is the live free depth of the StaticPoolPacketManager. */
+	return _mgr ? _mgr->getFreeCount() : 0;
+}
+
+void UartCompanionMesh::primePacketPool()
+{
+	if (!_mgr) {
+		return;
+	}
+	/* One alloc+free triggers StaticPoolPacketManager::init_pool() (lazy) and
+	 * returns the packet, leaving the full pool free. */
+	mesh::Packet *p = _mgr->allocNew();
+	if (p) {
+		_mgr->free(p);
+	}
 }
 
 void UartCompanionMesh::setDroneBaseContact(const uint8_t pubkey[PUB_KEY_SIZE])
@@ -67,7 +88,12 @@ bool UartCompanionMesh::sendDetectionToBase(const char *text)
 				break;
 			}
 		}
-		addPendingSend(text, /*attempt=*/1, expected_ack, idx, futureMillis((int)est_timeout));
+		/* text[0] is the formatter's kind prefix ('I' Identity / 'T'
+		 * Telemetry) — see rid_odid_format_{identity,telemetry}_msg. Only
+		 * Identity earns retries (checkTimeouts). */
+		bool identity = (text[0] == 'I');
+		addPendingSend(text, /*attempt=*/1, expected_ack, idx,
+			futureMillis((int)est_timeout), identity);
 	}
 
 	LOG_INF("sendDetectionToBase: sent to '%s' result=%d expected_ack=0x%08x est_timeout=%u",
@@ -76,7 +102,7 @@ bool UartCompanionMesh::sendDetectionToBase(const char *text)
 }
 
 void UartCompanionMesh::addPendingSend(const char *text, uint8_t attempt, uint32_t expected,
-	int contact_idx, uint32_t deadline_ms)
+	int contact_idx, uint32_t deadline_ms, bool identity)
 {
 	int slot = -1;
 	for (int i = 0; i < UART_COMPANION_ACK_TABLE_SIZE; i++) {
@@ -98,6 +124,7 @@ void UartCompanionMesh::addPendingSend(const char *text, uint8_t attempt, uint32
 	p.expected_ack = expected;
 	p.contact_idx = contact_idx;
 	p.deadline_ms = deadline_ms;
+	p.identity = identity;
 	p.active = true;
 }
 
@@ -117,6 +144,21 @@ void UartCompanionMesh::checkTimeouts()
 	for (int i = 0; i < UART_COMPANION_ACK_TABLE_SIZE; i++) {
 		PendingSend &p = _ack_table[i];
 		if (!p.active || !millisHasNowPassed(p.deadline_ms)) {
+			continue;
+		}
+
+		/* Any ACK-wait timeout feeds the base-down breaker (isBaseDown());
+		 * a confirmed ACK in processAck() clears it. */
+		if (_consecutive_no_ack < UINT32_MAX) {
+			_consecutive_no_ack++;
+		}
+
+		/* Telemetry is never retried — the next cadence interval re-sends
+		 * similar data, and retrying it would pin the packet pool during an
+		 * outage (docs/carrier-v3-write-combining.md §5). Retire it now. */
+		if (!p.identity) {
+			p.active = false;
+			_ack_stats.undelivered++;
 			continue;
 		}
 
@@ -217,6 +259,8 @@ ContactInfo *UartCompanionMesh::processAck(const uint8_t *data)
 		return nullptr;
 	}
 	_ack_stats.delivered++;
+	/* Confirmed delivery — the base is reachable again; clear the breaker. */
+	_consecutive_no_ack = 0;
 	ContactInfo ci;
 	if (!getContactByIdx(contact_idx, ci)) {
 		return nullptr;
