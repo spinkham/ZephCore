@@ -30,6 +30,23 @@
 	status = "okay";
 };
 
+/*
+ * BLE antenna: route the MG24 2.4GHz RF to the EXTERNAL u.FL, not the onboard
+ * ceramic antenna. The upstream xiao_mg24 board hogs rf_sw (PB04) LOW = onboard;
+ * on carrier v3 the MG24 uses an external u.FL antenna (the onboard radiator
+ * would be buried under the stacked Wio-SX1262 + carrier ground plane and can't
+ * meet the >=2x BLE range goal). PB04 HIGH = external per the Seeed XIAO MG24
+ * schematic (FM8625H RF switch); rf_sw_enable (PB05) stays HIGH = switch powered.
+ *
+ * NOTE: a bare bench MG24 flashed with this must have a u.FL antenna attached —
+ * the onboard ceramic antenna is no longer selected, so an unterminated u.FL
+ * means near-zero 2.4GHz sensitivity.
+ */
+&rf_sw {
+	/delete-property/ output-low;
+	output-high;
+};
+
 /* Disable I2C0 — default pins PC4(SCL)/PC5(SDA) conflict with NSS/RXEN */
 &i2c0 {
 	status = "disabled";
