@@ -112,9 +112,25 @@ void UartCompanionMesh::addPendingSend(const char *text, uint8_t attempt, uint32
 		}
 	}
 	if (slot < 0) {
-		/* Table full — circular overwrite (matches CompanionMesh). */
-		slot = _ack_next_overwrite;
-		_ack_next_overwrite = (_ack_next_overwrite + 1) % UART_COMPANION_ACK_TABLE_SIZE;
+		/* Table full. Evict a Telemetry entry first — Telemetry is never
+		 * retried, so losing its ACK wait costs only a stat. Only if every
+		 * slot holds an Identity fall back to circular overwrite (matches
+		 * CompanionMesh). */
+		for (int i = 0; i < UART_COMPANION_ACK_TABLE_SIZE; i++) {
+			if (!_ack_table[i].identity) {
+				slot = i;
+				break;
+			}
+		}
+		if (slot < 0) {
+			slot = _ack_next_overwrite;
+			_ack_next_overwrite = (_ack_next_overwrite + 1) % UART_COMPANION_ACK_TABLE_SIZE;
+		}
+		/* The evicted send can no longer be ACK-matched or retried; count it
+		 * as undelivered so ridstats stays honest during base outages. */
+		LOG_WRN("addPendingSend: ACK table full, evicting pending %s: '%.32s'",
+			_ack_table[slot].identity ? "Identity" : "Telemetry", _ack_table[slot].text);
+		_ack_stats.undelivered++;
 	}
 
 	PendingSend &p = _ack_table[slot];
