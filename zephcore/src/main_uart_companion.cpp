@@ -109,16 +109,17 @@ static const struct gpio_dt_spec led0 = GPIO_DT_SPEC_GET(LED0_NODE, gpios);
 /* ========================================================================
  * Drone-base contact — pinned placeholder pubkey.
  *
- * Matches MESHCORE_BASE_KEY in nodes/nrf52_meshcore_node/platformio_local.ini
- * (the Arduino carrier firmware's build-time-pinned drone-base contact).
- * Hardcoded here for the Phase 2 skeleton; a real config path (CLI/NVS) can
- * replace this later without touching the mesh plumbing.
+ * Must match MESHCORE_BASE_KEY in nodes/nrf52_meshcore_node/platformio_local.ini
+ * (the Heltec_v3_drone_base_us identity). If the drone base is reflashed and
+ * regenerates its identity, update both — a mismatched key means every send
+ * is dropped at the base before decrypt and never ACKed. A real config path
+ * (CLI/NVS) can replace this later without touching the mesh plumbing.
  * ======================================================================== */
 static const uint8_t drone_base_pubkey[PUB_KEY_SIZE] = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x3D, 0xFC, 0x00, 0xEB, 0x0E, 0x7D, 0x8E, 0x3A,
+	0xC1, 0x38, 0x89, 0x24, 0xDE, 0x83, 0x58, 0x0A,
+	0x88, 0xF0, 0xF6, 0x59, 0x6A, 0xAF, 0x7F, 0xFA,
+	0x3D, 0x33, 0x5E, 0x15, 0xC0, 0xC3, 0x4B, 0x61,
 };
 
 /* USB CLI configuration */
